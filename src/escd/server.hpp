@@ -177,10 +177,16 @@ class server {
                 msid_=0;
                 ELOG("START from a fresh database\n");
                 last_srvs_.init(now-BLOCKSEC);
+                bank_fee.resize(last_srvs_.nodes.size());
                 srvs_=last_srvs_;
                 memcpy(srvs_.oldhash,last_srvs_.nowhash,SHA256_DIGEST_LENGTH);
+                message_map empty;
+                srvs_.msg=0;
+                srvs_.msgl_put(empty,NULL);
+                finish_block();
+                write_header();
+                srvs_.now -= BLOCKSEC;
                 period_start=srvs_.nextblock(); //changes now!
-                bank_fee.resize(last_srvs_.nodes.size());
             }
             if(!do_fast) { //always sync on do_fast
                 do_sync=0;
@@ -886,7 +892,7 @@ NEXTUSER:
             boost::this_thread::sleep(boost::posix_time::seconds(1));
             RETURN_VAL_ON_SHUTDOWN(0);
         }
-        return 0;
+        // unreachable
     }
 
     uint32_t readmsid() {
@@ -1160,9 +1166,8 @@ NEXTUSER:
 
                     if(tm->second->svid==opts_.svid)
                     {
-                      extern bool finish;
                       ELOG("ERROR: trying to remove own invalid message, FATAL, MUST RESUBMIT (TODO!)\n");
-                      finish=true;
+                      SHUTDOWN();
                     }
 
                     continue;
@@ -1176,9 +1181,10 @@ NEXTUSER:
                         message_ptr msg=tm->second;
                         bad_insert(tm->second);
                         //remove_message(tm->second);
-                        txs_msgs_.erase(tm);
                         if(msg->svid==opts_.svid) {
                             sign_msgs_.push_front(msg);
+                        } else {
+                            txs_msgs_.erase(tm);
                         }
                     } else {
                         ELOG("INVALIDATE message %04X:%08X [min:%08X len:%d]\n",tm->second->svid,tm->second->msid,minmsid,tm->second->len);
@@ -1196,9 +1202,10 @@ NEXTUSER:
                         message_ptr msg=tm->second;
                         bad_insert(tm->second);
                         //remove_message(tm->second);
-                        txs_msgs_.erase(tm);
                         if(msg->svid==opts_.svid) {
                             sign_msgs_.push_front(msg);
+                        } else {
+                            txs_msgs_.erase(tm);
                         }
                     } else {
                         ELOG("MOVE message %04X:%08X [min:%08X len:%d]\n",tm->second->svid,tm->second->msid,minmsid,tm->second->len);
@@ -1281,27 +1288,32 @@ NEXTUSER:
         DLOG("LAST_block_final finished\n");
     }
 
-    void signlater()
-    { if(!sign_msgs_.empty()){ // sign again messages that failed to be accepted by the network on time
-        uint32_t ntime=time(NULL);
-        uint32_t msid=srvs_.nodes[opts_.svid].msid;
-        hash_t msha;
-        memcpy(msha,srvs_.nodes[opts_.svid].msha,sizeof(hash_t));
-        for(auto mp=sign_msgs_.begin();mp!=sign_msgs_.end();mp++){
-          msid++;
-          assert(msid==(*mp)->msid);
-          (*mp)->load(opts_.svid);
-          (*mp)->signnewtime(ntime,skey,pkey,msha); //FIXME, insert_user lacks data !
-          (*mp)->status &= ~MSGSTAT_BAD;
-          memcpy(msha,(*mp)->sigh,sizeof(hash_t));
-          (*mp)->save();
-          (*mp)->unload(opts_.svid);
-          check_.lock(); //maybe not needed if no validators
-          check_msgs_.push_back((*mp));
-          check_.unlock();
-          ntime++;}
-        sign_msgs_.clear();
-      }
+    void signlater() {
+        if (!sign_msgs_.empty()) { // sign again messages that failed to be accepted by the network on time
+            uint32_t ntime = time(NULL);
+            uint32_t msid = srvs_.nodes[opts_.svid].msid;
+            hash_t msha;
+            memcpy(msha, srvs_.nodes[opts_.svid].msha, sizeof(hash_t));
+            //for(auto mp=sign_msgs_.begin();mp!=sign_msgs_.end();mp++)
+            for (auto mp = txs_msgs_.find(sign_msgs_.front()->hash.num); mp != txs_msgs_.end(); mp++) {
+                if (opts_.svid != mp->second->svid) {
+                    break;
+                }
+                msid++;
+                assert(msid == mp->second->msid);
+                mp->second->load(opts_.svid);
+                mp->second->signnewtime(ntime, skey, pkey, msha);
+                mp->second->status &= ~MSGSTAT_BAD;
+                memcpy(msha, mp->second->sigh, sizeof(hash_t));
+                mp->second->save();
+                mp->second->unload(opts_.svid);
+                check_.lock(); //maybe not needed if no validators
+                check_msgs_.push_back(mp->second);
+                check_.unlock();
+                ntime++;
+            }
+            sign_msgs_.clear();
+        }
     }
 
     void count_votes(uint32_t now,hash_s& cand) {
@@ -2712,22 +2724,16 @@ NEXTUSER:
     }
 
     void log_broadcast(uint32_t path,char* p,int len,uint8_t* hash,uint8_t* pkey,uint32_t msid,uint32_t mpos) {
-        static uint32_t lpath=0;
         int fd=-1;
         static boost::mutex local_;
         boost::lock_guard<boost::mutex> lock(local_);
         char filename[64];
-        if(path!=lpath || fd<0) {
-            if(fd>=0) {
-                close(fd);
-            }
-            lpath=path;
-            Helper::FileName::getName(filename, path, "bro.log");
-            fd = open(filename, O_WRONLY|O_CREAT|O_TRUNC, 0644); //TODO maybe O_TRUNC not needed
-            if(fd<0) {
-                DLOG("ERROR, failed to open BROADCAST LOG %s\n",filename);
-                return;
-            }
+
+        Helper::FileName::getName(filename, path, "bro.log");
+        fd = open(filename, O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if(fd<0) {
+            DLOG("ERROR, failed to open BROADCAST LOG %s\n",filename);
+            return;
         }
         write(fd,p,len);
         write(fd,hash,32);
@@ -2863,36 +2869,37 @@ NEXTUSER:
                 return(false);
             }
             if((*p==TXSTYPE_USR && utxs.abank==utxs.bbank) || *p==TXSTYPE_UOK) { // check lock first
-                char* lpkey;
+                char* npkey;
+                uint32_t nuser;
                 if(*p==TXSTYPE_USR) {
-                    luser=utxs.nuser(p);
-                    lpkey=utxs.npkey(p);
+                    nuser=utxs.nuser(p);
+                    npkey=utxs.npkey(p);
                 } else { //UOK
-                    luser=utxs.auser;
-                    lpkey=utxs.upkey(p);
+                    nuser=utxs.auser;
+                    npkey=utxs.upkey(p);
                 }
-                if(luser>users) {
-                    DLOG("ERROR: bad target user id %08X\n",luser);
+                if(nuser>users) {
+                    DLOG("ERROR: bad target user id %08X\n",nuser);
                     close(fd);
                     return(false);
                 }
-                if(luser<users) { //1. check if overwriting was legal
-                    auto lu=changes.find(luser); // get user
+                if(nuser<users) { //1. check if overwriting was legal
+                    auto lu=changes.find(nuser); // get user
                     if(lu==changes.end()) {
                         user_t u;
                         bzero(&u, sizeof(user_t));
-                        lseek(fd,luser*sizeof(user_t),SEEK_SET); // should return '0s' for new user, ok for xor4
+                        lseek(fd,nuser*sizeof(user_t),SEEK_SET); // should return '0s' for new user, ok for xor4
                         read(fd,&u,sizeof(user_t));
-                        changes[luser]=u;
-                        undo[luser]=u;
-                        usera=&changes[luser];
+                        changes[nuser]=u;
+                        undo[nuser]=u;
+                        usera=&changes[nuser];
                     } else { // there should be no previous transaction on this user !!!
                         usera=&lu->second;
                     }
                     int64_t delta=usera->weight;
                     if(!(usera->stat&USER_STAT_DELETED)) {
                         ELOG("ERROR, overwriting active account %04X:%08X [weight:%016lX]\n",
-                             utxs.bbank,luser,usera->weight);
+                             utxs.bbank,nuser,usera->weight);
                         close(fd);
                         return(false);
                     }
@@ -2902,17 +2909,17 @@ NEXTUSER:
                     user_t u;
                     bzero(&u,sizeof(user_t));
                     users++;
-                    changes[luser]=u;
-                    usera=&changes[luser];
+                    changes[nuser]=u;
+                    usera=&changes[nuser];
                 }
                 srvs_.xor4(csum,usera->csum);
                 if(*p==TXSTYPE_USR) {
-                    srvs_.init_user(*usera,msg->svid,luser,USER_MIN_MASS,(uint8_t*)lpkey,utxs.ttime,utxs.abank,utxs.auser);
+                    srvs_.init_user(*usera,msg->svid,nuser,USER_MIN_MASS,(uint8_t*)npkey,utxs.ttime,utxs.abank,utxs.auser);
                 } else {
-                    srvs_.init_user(*usera,msg->svid,luser,0,(uint8_t*)lpkey,utxs.ttime,utxs.bbank,utxs.buser);
+                    srvs_.init_user(*usera,msg->svid,nuser,0,(uint8_t*)npkey,utxs.ttime,utxs.bbank,utxs.buser);
                 }
                 srvs_.xor4(csum,usera->csum);
-                srvs_.put_user(*usera,msg->svid,luser);
+                srvs_.put_user(*usera,msg->svid,nuser);
                 if(*p==TXSTYPE_USR) {
                     weight+=USER_MIN_MASS;
                 } else { //*p==TXSTYPE_UOK
@@ -2920,7 +2927,7 @@ NEXTUSER:
                     uok.auser=utxs.auser;
                     uok.bbank=utxs.bbank;
                     uok.buser=utxs.buser;
-                    memcpy(uok.pkey,lpkey,32);
+                    memcpy(uok.pkey,npkey,32);
                     uint64_t ppb=make_ppi(tmpos,omsid,msg->msid,msg->svid,msg->svid); //not utxs.bbank
                     txs_uok[ppb]=uok;
                     p+=utxs.size;
@@ -3105,11 +3112,11 @@ NEXTUSER:
                     usr_t usr;
                     usr.auser=utxs.auser;
                     usr.bbank=utxs.bbank;
-                    memcpy(usr.pkey,usera->pkey,32);
+                    memcpy(usr.pkey,utxs.npkey(p),32);
                     uint64_t ppb=make_ppi(tmpos,omsid,msg->msid,msg->svid,msg->svid); //not utxs.bbank
                     txs_usr[ppb]=usr;
                     if(utxs.bbank==opts_.svid) { //respond to account creation request
-                        ofip_add_remote_user(utxs.abank,utxs.auser,usera->pkey);
+                        ofip_add_remote_user(utxs.abank,utxs.auser,usr.pkey);
                     }
                 }
 
@@ -4339,6 +4346,7 @@ NEXTBANK:
         }
 //#endif
         srvs_.finish(); //FIXME, add locking
+
         ELOG("SPEED: %.1f  [txs:%lu]\n",(float)srvs_.txs/(float)BLOCKSEC,srvs_.txs);
         last_srvs_=srvs_; // consider not making copies of nodes
         memcpy(srvs_.oldhash,last_srvs_.nowhash,SHA256_DIGEST_LENGTH);
@@ -4377,9 +4385,10 @@ NEXTBANK:
 
         boost::thread archOldBlocks_thread(boost::bind(Helper::arch_old_blocks, this->srvs_.now - BLOCKSEC));
         archOldBlocks_thread.detach();
+#else
+        srvs_.clean_old(opts_.svid);
 #endif
-
-//        srvs_.clean_old(opts_.svid);
+        signlater(); // sign own removed messages
     }
 
     //message_ptr write_handshake(uint32_t ipv4,uint32_t port,uint16_t peer)
@@ -4468,7 +4477,7 @@ NEXTBANK:
           return(0);
         }
 
-        usertxs txs(TXSTYPE_CON,opts_.port&0xFFFF,opts_.ipv4,0);
+        usertxs txs(TXSTYPE_CON,opts_.port&0xFFFF,opts_.ipv4,settings::get_version(16).c_str());
         user_t u0;
         int fd=open_bank(opts_.svid);
         read(fd,&u0,sizeof(user_t));
@@ -4478,7 +4487,9 @@ NEXTBANK:
             return(0);
         }
         // add location info. FIXME, set location to 0 before exit
-        line.append((char*)txs.data,txs.size);
+        if(line[0] != TXSTYPE_CON) { // do not send if server::update_connection_info
+          line.append((char*)txs.data,txs.size);
+        }
         int msid=++msid_; // can be atomic
         memcpy(msha_,srvs_.nodes[opts_.svid].msha,sizeof(hash_t));
         message_ptr msg(new message(MSGTYPE_MSG,(uint8_t*)line.c_str(),(int)line.length(),opts_.svid,msid,skey,pkey,msha_));
@@ -4723,19 +4734,20 @@ NEXTBANK:
         while(1) {
             uint32_t now=time(NULL);
             //const char* plist=peers_list();
-            const char* plist = m_peerManager.getActualPeerList().c_str();
+            std::string plist = m_peerManager.getActualPeerList();
             int peerCount = m_peerManager.getPeersCount(true);
             int allpeerCount = m_peerManager.getPeersCount(false);
+            int tickets = ofip_get_tickets();
             if(missing_msgs_.size()) {
-                ELOG("CLOCK: %02lX (check:%d wait:%d peers:%d allpeers:%d hash:%8X now:%8X msg:%u txs:%lu) [%s] (miss:%d:%016lX)\n",
+                ELOG("CLOCK: %02lX (check:%d wait:%d peers:%d allpeers:%d hash:%8X now:%8X ticket:%u msg:%u txs:%lu) [%s] (miss:%d:%016lX)\n",
                      ((long)(srvs_.now+BLOCKSEC)-(long)now),(int)check_msgs_.size(),
                      //(int)wait_msgs_.size(),(int)peers_.size(),(uint32_t)*((uint32_t*)srvs_.nowhash),srvs_.now,plist,
-                     (int)wait_msgs_.size(),peerCount,allpeerCount, srvs_.nowh32(),srvs_.now,srvs_.msg,srvs_.txs,plist,
+                     (int)wait_msgs_.size(),peerCount,allpeerCount,srvs_.nowh32(),srvs_.now,tickets,srvs_.msg,srvs_.txs,plist.c_str(),
                      (int)missing_msgs_.size(),missing_msgs_.begin()->first);
             } else {
-                ELOG("CLOCK: %02lX (check:%d wait:%d peers:%d allpeers:%d hash:%8X now:%8X msg:%u txs:%lu) [%s]\n",
+                ELOG("CLOCK: %02lX (check:%d wait:%d peers:%d allpeers:%d hash:%8X now:%8X ticket:%u msg:%u txs:%lu) [%s]\n",
                      ((long)(srvs_.now+BLOCKSEC)-(long)now),(int)check_msgs_.size(),
-                     (int)wait_msgs_.size(),peerCount,allpeerCount,srvs_.nowh32(),srvs_.now,srvs_.msg,srvs_.txs,plist);
+                     (int)wait_msgs_.size(),peerCount,allpeerCount,srvs_.nowh32(),srvs_.now,tickets,srvs_.msg,srvs_.txs,plist.c_str());
             }
             if(now>(srvs_.now+((BLOCKSEC*3)/4)) && (last_srvs_.vok<last_srvs_.vtot/2 && !opts_.init)) { // '<' not '<='
                 panic=true;
@@ -4837,6 +4849,15 @@ NEXTBANK:
         }
     }
 
+    void update_connection_info(std::string& message)
+    {
+      // send connection info if node address changed and periodically at least once per dividend period (nodes inactive for dividend period are removed from vip list)
+      if(opts_.svid && msid_ == last_srvs_.nodes[opts_.svid].msid && (srvs_.nodes[opts_.svid].ipv4 != opts_.ipv4 || srvs_.nodes[opts_.svid].port != (opts_.port&0xFFFF) || srvs_.nodes[opts_.svid].mtim < srvs_.now - BLOCKDIV*BLOCKSEC/2)) {
+        usertxs txs(TXSTYPE_CON,opts_.port&0xFFFF,opts_.ipv4,settings::get_version(16).c_str());
+        message.append((char*)txs.data,txs.size);
+      }
+    }
+
     bool break_silence(uint32_t now,std::string& message,uint32_t& tnum) { // will be obsolete if we start tolerating empty blocks
         static uint32_t do_hallo=0;
         static uint32_t del=0;
@@ -4852,7 +4873,7 @@ NEXTBANK:
             DLOG("SILENCE, sending void message due to silence\n");
 //#ifdef DEBUG
             if(rand()%2) {
-                usertxs txs(TXSTYPE_CON,opts_.port&0xFFFF,opts_.ipv4,0);
+                usertxs txs(TXSTYPE_CON,opts_.port&0xFFFF,opts_.ipv4,settings::get_version(16).c_str());
                 message.append((char*)txs.data,txs.size);
             } else {
                 usertxs txs((uint32_t)(rand()%32));
@@ -4958,6 +4979,7 @@ NEXTBANK:
     void ofip_readwrite();
     void ofip_readonly();
     bool ofip_isreadonly();
+    int ofip_get_tickets();
 
     //FIXME, move this to servers.hpp
     //std::set<uint16_t> last_svid_dbl; //list of double spend servers in last block
@@ -5007,7 +5029,7 @@ NEXTBANK:
     std::map<hash_s,candidate_ptr,hash_cmp> candidates_; // list of candidates, TODO should be map of message_ptr
     message_queue wait_msgs_;
     message_queue check_msgs_;
-    message_queue sign_msgs_;
+    message_queue sign_msgs_; //TODO, could be just a pointer to first message, since all later (own) messages in txs_msgs_ must be signed again
     std::map<hash_s,message_ptr,hash_cmp> bad_msgs_;
     message_map missing_msgs_; //TODO, start using this, these are messages we still wait for
     message_map txs_msgs_; //_TXS messages (transactions)

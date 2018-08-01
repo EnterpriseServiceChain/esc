@@ -116,13 +116,13 @@ bool SendMany::checkSignature(const uint8_t* hash, const uint8_t* pk) {
 }
 
 void SendMany::saveResponse(settings& sts) {
-    if (!std::equal(sts.pk, sts.pk + SHA256_DIGEST_LENGTH, m_response.usera.pkey)) {
+    if (!sts.without_secret && !std::equal(sts.pk, sts.pk + SHA256_DIGEST_LENGTH, m_response.usera.pkey)) {
         m_responseError = ErrorCodes::Code::ePkeyDiffers;
     }
 
     std::array<uint8_t, SHA256_DIGEST_LENGTH> hashout;
     Helper::create256signhash(getSignature(), getSignatureSize(), sts.ha, hashout);
-    if (!std::equal(hashout.begin(), hashout.end(), m_response.usera.hash)) {
+    if (!sts.signature_provided && !std::equal(hashout.begin(), hashout.end(), m_response.usera.hash)) {
         m_responseError = ErrorCodes::Code::eHashMismatch;
     }
 
@@ -143,6 +143,9 @@ uint32_t SendMany::getTime() {
 }
 
 int64_t SendMany::getFee() {
+    // TODO: CommandHandler::validateModifyingCommand is called before onInit so m_transactions could be not initialized
+    initTransactionVector();
+
     uint64_t fee = 0;
     for (auto &it : m_transactions) {
         fee+=TXS_MPT_FEE(it.amount);
@@ -157,6 +160,9 @@ int64_t SendMany::getFee() {
 }
 
 int64_t SendMany::getDeduct() {
+    // TODO: CommandHandler::validateModifyingCommand is called before onInit so m_transactions could be not initialized
+    initTransactionVector();
+
     int64_t deduct = 0;
     for (auto &it : m_transactions) {
         deduct += it.amount;
@@ -217,6 +223,9 @@ void SendMany::fillAdditionalData() {
 }
 
 void SendMany::initTransactionVector() {
+    if(m_transactions.size() > 0) {
+        return;
+    }
     int size = this->getAdditionalDataSize();
     if (m_additionalData && size > 0) {
         SendAmountTxnRecord txn_record;
@@ -230,6 +239,7 @@ void SendMany::initTransactionVector() {
 }
 
 void SendMany::checkForDuplicates() {
+    initTransactionVector();
     std::set<std::pair<uint16_t, uint32_t>> checkForDuplicate;
     for (auto &it : m_transactions) {
         uint16_t node = it.dest_node;
@@ -238,14 +248,15 @@ void SendMany::checkForDuplicates() {
             ELOG("ERROR: duplicate target: %04X:%08X\n", node, user);
             throw ErrorCodes::Code::eDuplicatedTarget;
         }
-        if (it.amount < 0) {
-            ELOG("ERROR: only positive non-zero transactions allowed in MPT\n");
-            throw ErrorCodes::Code::eAmountBelowZero;
+        if (it.amount <= 0) {
+            ELOG("ERROR: only positive transactions allowed in MPT\n");
+            throw ErrorCodes::Code::eAmountNotPositive;
         }
     }
 }
 
 std::vector<SendAmountTxnRecord> SendMany::getTransactionsVector() {
+    initTransactionVector();
     return m_transactions;
 }
 
@@ -287,7 +298,7 @@ void SendMany::txnToJson(boost::property_tree::ptree& ptree) {
             txn.put(TAG::AMOUNT, print_amount(it.amount));
             txns.push_back(std::make_pair("", txn));
         }
-        ptree.add_child("transactions", txns);
+        ptree.add_child("wires", txns);
     }
 
     ptree.put(TAG::SIGN, ed25519_key2text(getSignature(), getSignatureSize()));

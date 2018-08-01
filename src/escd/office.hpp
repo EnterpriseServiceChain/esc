@@ -416,6 +416,10 @@ class office {
                 srv_.break_silence(now,message,message_tnum);
                 file_.unlock();
 #endif
+                file_.lock();
+                // send connection info if outdated and no transactions
+                srv_.update_connection_info(message);
+                file_.unlock();
                 continue;
             }
             assert(svid);
@@ -540,7 +544,7 @@ class office {
         //file_.lock(); //FIXME, could use read only access without lock
         int fd=open(ofifilename,O_RDONLY);
         if(fd<0) {
-            ELOG("ERROR, failed to open account file %s\n",ofifilename);
+            ELOG("ERROR, office failed to open account file %s\n",ofifilename);
             return(false);
         }
 
@@ -616,7 +620,7 @@ class office {
         nuser=users++;
         mklogfile(svid,nuser);
         srv_.last_srvs_.init_user(nu,svid,nuser,(abank==svid?USER_MIN_MASS:0),pk,when,abank,auser);
-        ELOG("CREATING new account %d\n",nuser);
+        DLOG("CREATING new account %d\n",nuser);
         file_.lock();
         //deposit.push_back(0);
         //ustatus.push_back(0);
@@ -1283,6 +1287,11 @@ class office {
             return(NULL);
         }
         return(srv_.last_srvs_.nodes[node].pk); // use an old key !!!
+    }
+
+    int get_tickets()
+    {
+      return clients_.size();
     }
 
     uint16_t svid;

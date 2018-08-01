@@ -158,6 +158,12 @@ const std::string print_msg_id(uint16_t node, uint32_t user, int32_t _suffix) {
     return std::string(acnt);
 }
 
+const std::string print_msg_pack_id(uint16_t node, uint32_t msg_id) {
+    char acnt[19];
+    sprintf(acnt,"%04X:%08X", node, msg_id);
+    return std::string(acnt);
+}
+
 void print_log(boost::property_tree::ptree& pt, uint16_t bank, uint32_t user, uint32_t lastlog, int txnType = -1) {
     char filename[64];
     sprintf(filename,"log/%04X_%08X.bin", bank, user);
@@ -365,8 +371,11 @@ void print_log(boost::property_tree::ptree& pt, uint16_t bank, uint32_t user, ui
         }
         if(ulog.node > 0) {
             logentry.put("node",ulog.node);
-            logentry.put("account",ulog.user);
-            logentry.put("address",acnt);
+            // create_account on remote node sets node, but created address is unknown
+            if(txst != TXSTYPE_USR || ulog.node == bank) {
+                logentry.put("account",ulog.user);
+                logentry.put("address",acnt);
+            }
         }
         if(!ulog.nmid) {
             char blockhex[9];
